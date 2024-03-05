@@ -1,105 +1,218 @@
 #include "threadPool.h"
-#include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
-#include <error.h>
+#include <unistd.h>
 #include <string.h>
+#include <errno.h>
+#include <stdio.h>
 
-#define DEFAULT_MIN_THREADS    5
-#define DEFAULT_MAX_THREADS    10
-#define DEFAULT_QUEUE_CAPACITY 100
-
+#define NUMBER 2
+/* 状态码 */
 enum STATUS_CODE
 {
     ON_SUCCESS,
     NULL_PTR,
     MALLOC_ERROR,
-    ACCESS_INVALID,
+    INVALID_ACCESS,
+    THREAD_CREATE_ERR,
     UNKNOWN_ERROR,
 };
 
-/* 本质是一个消费者 */
-void * threadHander(void *arg)
+#define DEFAULT_MIN_THREADS 5
+#define DEFAULT_MAX_THREADS 100
+#define DEFAULT_MAX_QUEUES 100
+
+/* 静态函数前置声明 */
+static void *thread_Hander(void *arg);
+static void *manager_Hander(void *arg);
+
+static int pthreadExitClearThreadIndex(threadPool_t *pool)
 {
-    /* 强制类型转换 */
-    threadpool_t *pool = (threadpool_t *)arg;
+    int ret = 0;
+
+    /* 需要判断当前线程是在数组threads对应的哪一个索引里面. */
+    for (int idx = 0; idx < pool->maxThreads; idx++)
+    {
+        if (pool->threadIds[idx] == pthread_self())
+        {
+            /* 将需要退出的线程 对应的索引清空. */
+            pool->threadIds[idx] = 0;
+            printf("我清理好了！下班了\n");
+            break;
+        }
+    }
+
+    pthread_exit(NULL);
+    return ret;
+}
+
+/* 本质是一个消费者函数 */
+static void *thread_Hander(void *arg)
+{
+    threadPool_t *pool = (threadPool_t *)arg;
+    sleep(2); //???
     while (1)
     {
-        pthread_mutex_lock(&(pool->mutexpool));
-        while (pool->queueSize == 0)
+        pthread_mutex_lock(&(pool->mutexPool));
+        /* 没有任务消费的时候 */
+        while (pool->queueSize == 0 && pool->shutdown == 0)
         {
-            /* 等待一个条件变量 ，生产者发送过来的 */
-            pthread_cond_wait(&(pool->notEmpty), &(pool->mutexpool));
+            pthread_cond_wait(&(pool->notEmpty), &(pool->mutexPool));
+
+            if (pool->exitThreadNums > 0)
+            {
+                /* 需要销毁的线程数减一. */
+                pool->exitThreadNums--;
+
+                if (pool->liveThreadNums > pool->minThreads)
+                {
+                    /* 活着的线程数减一 */
+                    pool->liveThreadNums--;
+                    /* 解锁 */
+                    pthread_mutex_unlock(&(pool->mutexPool));
+                    pthreadExitClearThreadIndex(pool);
+                }
+            }
         }
-        /* 意味着任务队列有任务 */
 
-        task_t tmpTask = pool->taskQueue[pool->queueFront];
-        pool->queueFront = (pool->queueFront + 1) % pool->queueCapacity;
-        /* 任务数减一 */
+        /* 销毁线程池 标识位置1. */
+        if (pool->shutdown == 1)
+        {
+
+            /* 解锁 */
+            pthread_mutex_unlock(&(pool->mutexPool));
+            printf("我去收拾东西下班了！\n");
+            /* 线程退出 */
+            pthreadExitClearThreadIndex(pool);
+        }
+
+        /* 从任务队列中取数据 -- 从队列的对头取数据 */
+        task_t task = pool->taskQueue[pool->queueFront];
+        /* 任务队列的任务数减一. */
         pool->queueSize--;
+        /* front 向后移动. */
+        pool->queueFront = (pool->queueFront + 1) % pool->queueCapacity;
+        pthread_mutex_unlock(&(pool->mutexPool));
+        pthread_cond_signal(&(pool->notFull));
 
-        pthread_mutex_unlock(&(pool->mutexpool));
-        /* 发一个信号给生产者 告诉他可以继续生产 */
-        pthread_cond_signal(&pool->notFull);
-
-        /* 为了提升性能，再创建一把只能维护busyNum属性的锁 */
-        pthread_mutex_lock(&pool->mutexBusy);
+        printf("thread %ld start working...\n", pthread_self());
+        pthread_mutex_lock(&(pool->mutexBusy));
+        /* 忙碌的线程数加一. */
         pool->busyThreadNums++;
-        pthread_mutex_unlock(&pool->mutexBusy);
+        pthread_mutex_unlock(&(pool->mutexBusy));
 
-        /* 执行钩子函数 - 回调函数 */
-        tmpTask.work_hander(tmpTask.arg);
+        /* 执行处理函数 */
+        task.worker_hander(task.arg);
 
-        pthread_mutex_lock(&pool->mutexBusy);
+        pthread_mutex_lock(&(pool->mutexBusy));
+
+        /* 忙碌的线程数加一. */
         pool->busyThreadNums--;
-        pthread_mutex_unlock(&pool->mutexBusy);
+        pthread_mutex_unlock(&(pool->mutexBusy));
+    }
+}
+
+/* 管理者 */
+static void *manager_Hander(void *arg)
+{
+    threadPool_t *pool = (threadPool_t *)arg;
+    while (pool->shutdown != 1)
+    {
+        sleep(3);
+        pthread_mutex_lock(&(pool->mutexPool));
+        int liveThreadNums = pool->liveThreadNums;
+        int queueSize = pool->queueSize;
+        pthread_mutex_unlock(&(pool->mutexPool));
+
+        pthread_mutex_lock(&(pool->mutexBusy));
+        int busyThreadNums = pool->busyThreadNums;
+        pthread_mutex_unlock(&(pool->mutexBusy));
+
+        /* 扩大线程池中线程的容量 */
+        /* 任务的个数 > 存活的线程个数 && 存活的线程数 < 最大线程数 */
+        if (queueSize > liveThreadNums && liveThreadNums < pool->maxThreads)
+        {
+            int count = 0;
+            /* 加锁 */
+            pthread_mutex_lock(&(pool->mutexPool));
+            for (int idx = 0; idx < pool->maxThreads && count < NUMBER && pool->liveThreadNums < pool->maxThreads; idx++)
+            {
+                if (pool->threadIds[idx] == 0)
+                {
+                    pthread_create(&(pool->threadIds[idx]), NULL, thread_Hander, pool);
+                    count++;
+                    /* 更新线程池存活的线程数 */
+                    pool->liveThreadNums++;
+                }
+            }
+            /* 解锁 */
+            pthread_mutex_unlock(&(pool->mutexPool));
+        }
+
+        /* 缩小线程池中线程的容量 */
+        /* 忙的线程数 * 2 < 存活的线程数 && 存活的线程 > 最小线程数 */
+        if (busyThreadNums * 2 < liveThreadNums && liveThreadNums > pool->minThreads)
+        {
+            pthread_mutex_lock(&(pool->mutexPool));
+            pool->exitThreadNums = NUMBER;
+            pthread_mutex_unlock(&(pool->mutexPool));
+
+            /* 唤醒等待工作的线程 -- 等待工作的线程就是空闲的线程 */
+            for (int idx = 0; idx < NUMBER; idx++)
+            {
+                /* 发送信号. */
+                pthread_cond_signal(&(pool->notEmpty));
+            }
+        }
     }
     pthread_exit(NULL);
 }
 
-/* 线程池初始化 */
-int threadPoolInit(threadpool_t *pool, int minThreads, int maxThreads, int queueCapacity)
+/* 初始化线程池 */
+int threadPoolInit(threadPool_t *pool, int minThreadNums, int maxThreadNums, int taskQueueCapacity)
 {
     if (pool == NULL)
     {
         return NULL_PTR;
     }
 
+    /* do ... while 循环 */
     do
     {
         /* 判断合法性 */
-        if (minThreads <= 0 || maxThreads <= 0 || minThreads >= maxThreads)
+        if (minThreadNums <= 0 || maxThreadNums <= 0 || minThreadNums > maxThreadNums)
         {
-            minThreads = DEFAULT_MIN_THREADS;
-            maxThreads = DEFAULT_MAX_THREADS;
+            minThreadNums = DEFAULT_MIN_THREADS;
+            maxThreadNums = DEFAULT_MAX_THREADS;
         }
-
-        /* 更新线程池 线程属性 */
-        pool->minThreads = minThreads;
-        pool->maxThreads = maxThreads;
-        /* 初始化时，忙碌的线程数为0 */
-        pool->busyThreadNums = 0;
 
         /* 判断合法性 */
-        if (queueCapacity <= 0)
+        if (taskQueueCapacity < 0)
         {
-            queueCapacity = DEFAULT_QUEUE_CAPACITY;
+            taskQueueCapacity = DEFAULT_MAX_QUEUES;
         }
-        /* 更新线程池 任务队列属性 */
-        pool->queueCapacity = queueCapacity;
-        pool->taskQueue = (task_t *)malloc(sizeof(task_t) * queueCapacity);
-        if (pool->taskQueue == NULL)
-        {
-            perror("malloc error");
-            break;
-        }
-        /* 清除脏数据 */
-        memset(pool->taskQueue, 0, sizeof(task_t) * pool->queueCapacity);
-        pool->queueFront = 0;
-        pool->queueRear = 0;
+
+        pool->minThreads = minThreadNums;
+        pool->maxThreads = maxThreadNums;
+        /* 队列的容量 */
+        pool->queueCapacity = taskQueueCapacity;
+        /* 队列任务数大小 */
         pool->queueSize = 0;
 
-        /* 为线程ID分配堆空间 */
+        /* 任务队列 */
+        pool->taskQueue = (struct task_t *)malloc(sizeof(struct task_t) * (pool->queueCapacity));
+        if (pool->taskQueue == NULL)
+        {
+            perror("malloc erorr");
+            break;
+        }
+        /* 循环队列队头位置 */
+        pool->queueFront = 0;
+        /* 循环队列队尾位置 */
+        pool->queueRear = 0;
+
         pool->threadIds = (pthread_t *)malloc(sizeof(pthread_t) * pool->maxThreads);
+
         if (pool->threadIds == NULL)
         {
             perror("malloc error");
@@ -109,78 +222,92 @@ int threadPoolInit(threadpool_t *pool, int minThreads, int maxThreads, int queue
         memset(pool->threadIds, 0, sizeof(pthread_t) * pool->maxThreads);
 
         int ret = 0;
-        /* 创建线程 */
+        /* 工作线程的创建 */
         for (int idx = 0; idx < pool->minThreads; idx++)
         {
-            /* 如果线程ID号为0 那么这个位置可以用 */
-            if (pool->threadIds[idx] == 0)
+            ret = pthread_create(&(pool->threadIds[idx]), NULL, thread_Hander, (void *)pool);
+            // printf("创建了一个线程->%ld\n", pool->threadIds[idx]);
+            if (ret != 0)
             {
-                ret = pthread_create(&(pool->threadIds[idx]), NULL, threadHander, pool);
-                if (ret != 0)
-                {
-                    perror("thread create error");
-                    break;
-                }
+                perror("pthread create error");
+                break;
             }
         }
-        /* 此ret是创建线程函数的返回值 */
+
+        /* 管理者线程的创建 */
+        ret = pthread_create(&pool->managerThread, NULL, manager_Hander, (void *)pool);
         if (ret != 0)
         {
+            perror("pthread create error");
             break;
         }
+        pool->liveThreadNums = minThreadNums;
+        pool->busyThreadNums = 0;
 
-        /* 存活的线程数 等于 开辟的线程数 */
-        pool->liveThreadNums = pool->minThreads;
-
-        /* 初始化锁资源 */
-        pthread_mutex_init(&(pool->mutexpool), NULL);
-        pthread_mutex_init(&(pool->mutexBusy), NULL);
-        /* 初始化条件变量资源 */
-        if (pthread_cond_init(&(pool->notEmpty), NULL) != 0 || pthread_cond_init(&(pool->notFull), NULL) != 0)
+        if (
+            pthread_mutex_init(&(pool->mutexPool), NULL) != 0 ||
+            pthread_mutex_init(&(pool->mutexBusy), NULL) != 0)
         {
-            perror("thread cond error");
+            perror("mutex error ");
             break;
         }
 
+        if (
+            pthread_cond_init(&(pool->notFull), NULL) != 0 ||
+            pthread_cond_init(&(pool->notEmpty), NULL) != 0)
+        {
+            perror("cond error ");
+            break;
+        }
+
+        /* 销毁线程池 标识位置0. */
+        pool->shutdown = 0;
         return ON_SUCCESS;
-    } while(0);
+    } while (0);
 
-    /* 程序执行到这个地方，上面一定有失败 */
+    /* 程序到达这边意味着上面初始化流程出现了错误 */
 
-    /* 回收堆空间 */
+    /* 释放内存 */
     if (pool->taskQueue != NULL)
     {
         free(pool->taskQueue);
         pool->taskQueue = NULL;
     }
 
-    /* 回收线程资源 */
-    for (int idx = 0; idx < pool->minThreads; idx++)
+    if (pool->threadIds)
     {
-        if (pool->threadIds[idx] != 0)
+        /* 阻塞回收工作线程资源 */
+        for (int idx = 0; idx < pool->minThreads; idx++)
         {
-            pthread_join(pool->threadIds[idx], NULL);
+            if (pool->threadIds[idx] != 0)
+            {
+                pthread_join(pool->threadIds[idx], NULL);
+            }
         }
-    }
 
-    if (pool->threadIds != NULL)
-    {
+        /* 释放内存 */
         free(pool->threadIds);
         pool->threadIds = NULL;
     }
 
-    /* 释放锁资源 */
-    pthread_mutex_destroy(&(pool->mutexpool));
-    pthread_mutex_destroy(&(pool->mutexBusy));
-    /* 释放条件变量资源 */
+    /* 阻塞回收管理者线程资源 */
+    if (pool->managerThread != 0)
+    {
+        pthread_join(pool->managerThread, NULL);
+    }
+
+    /* 释放锁和条件变量 */
+    pthread_mutex_destroy(&pool->mutexBusy);
+    pthread_mutex_destroy(&pool->mutexPool);
     pthread_cond_destroy(&(pool->notEmpty));
     pthread_cond_destroy(&(pool->notFull));
 
     return UNKNOWN_ERROR;
 }
 
-/* 线程池添加任务 */
-int threadPoolAddTask(threadpool_t *pool, void *(worker_hander)(void *), void *arg)
+/* 添加任务 */
+/* 本质上是生产者 */
+int threadPoolAddTask(threadPool_t *pool, void *(*worker_hander)(void *arg), void *arg)
 {
     if (pool == NULL)
     {
@@ -188,29 +315,81 @@ int threadPoolAddTask(threadpool_t *pool, void *(worker_hander)(void *), void *a
     }
 
     /* 加锁 */
-    pthread_mutex_lock(&(pool->mutexpool));
+    pthread_mutex_lock(&(pool->mutexPool));
     /* 任务队列满了 */
-    while (pool->queueSize == pool->queueCapacity)
+    while (pool->queueSize == pool->queueCapacity && pool->shutdown == 0)
     {
-        pthread_cond_wait(&(pool->notFull), &(pool->mutexpool));
+        /* 等待条件变量 : 不满的条件变量 */
+        pthread_cond_wait(&(pool->notFull), &(pool->mutexPool));
     }
-    /* 程序到这个地方一定有位置可以放任务 */
+
+    if (pool->shutdown != 0)
+    {
+        pthread_mutex_unlock(&(pool->mutexPool));
+        return ON_SUCCESS;
+    }
+
+    /* 将新的任务 添加到任务队列中 */
     pool->taskQueue[pool->queueRear].worker_hander = worker_hander;
     pool->taskQueue[pool->queueRear].arg = arg;
-    /* 队尾向后移动 */
-    pool->queueRear = (pool->queueRear + 1) % pool->queueCapacity;
-    /* 任务数加一 */
+    /* 任务个数加一 */
     pool->queueSize++;
-    /* 解锁 */
-    pthread_mutex_unlock(&(pool->mutexpool));
-    /* 发信号 */
+    /* 该队列是循环队列 -- 要让此索引循环起来. */
+    pool->queueRear = (pool->queueRear + 1) % pool->queueCapacity;
+
+    pthread_mutex_unlock(&(pool->mutexPool));
     pthread_cond_signal(&(pool->notEmpty));
 
     return ON_SUCCESS;
 }
+
 /* 线程池销毁 */
-int threadPoolDestroy(threadpool_t *pool)
+int threadPoolDestroy(threadPool_t *pool)
 {
-    int ret = 0;
-    return ret;
+    if (pool == NULL)
+    {
+        return NULL_PTR;
+    }
+
+    pool->shutdown = 1;
+    printf("下班了！！！\n");
+
+    /* 阻塞回收管理者线程 */
+    pthread_join(pool->managerThread, NULL);
+
+    /* 唤醒阻塞的消费者线程 */
+    for (int idx = 0; idx < pool->liveThreadNums; idx++)
+    {
+        pthread_cond_signal(&(pool->notEmpty));
+    }
+
+    sleep(3);
+    /* 释放堆空间 */
+    if (pool->taskQueue)
+    {
+        free(pool->taskQueue);
+        pool->taskQueue = NULL;
+    }
+
+    if (pool->threadIds)
+    {
+        printf("!!!!!!!!\n");
+        printf("threadId:%p\n", pool->threadIds);
+        free(pool->threadIds);
+        printf("!!!!!!!!\n");
+        pool->threadIds = NULL;
+    }
+
+    pthread_mutex_destroy(&(pool->mutexPool));
+    pthread_mutex_destroy(&(pool->mutexBusy));
+    pthread_cond_destroy(&(pool->notEmpty));
+    pthread_cond_destroy(&(pool->notFull));
+
+    // if (pool)
+    // {
+    //     free(pool);
+    //     pool = NULL;
+    // }
+
+    return ON_SUCCESS;
 }
